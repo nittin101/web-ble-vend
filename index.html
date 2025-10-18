@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Smart Vending Machine</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    text-align: center;
+    background-color: #f7f7f7;
+    padding: 30px;
+  }
+  h1 { color: #333; }
+  .item {
+    background: white;
+    border-radius: 10px;
+    padding: 15px;
+    margin: 10px auto;
+    width: 250px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+  }
+  button {
+    background-color: #007bff;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  button:disabled {
+    background-color: gray;
+  }
+</style>
+</head>
+<body>
+<h1>Smart Vending Machine</h1>
+<p>Select an item and pay using Google Pay Sandbox</p>
+<div style="margin:10px;">
+  <label><input type="checkbox" id="demoToggle"> Demo mode (no Bluetooth)</label>
+</div>
+<div id="items"></div>
+<p id="status"></p>
+
+<script>
+// --- Environment checks ---
+const statusEl = document.getElementById('status');
+const demoToggle = document.getElementById('demoToggle');
+const hasWebBluetooth = !!(navigator.bluetooth);
+if (!hasWebBluetooth) {
+  statusEl.textContent = 'Web Bluetooth not available in this environment. Use Chrome on Android over HTTPS (not in preview). Turning on Demo Mode.';
+  demoToggle.checked = true;
+}
+
+// BLE constants from your verified protocol
+const SERVICE_UUID = '0000ff12-0000-1000-8000-00805f9b34fb';
+const WRITE_UUID   = '0000ff15-0000-1000-8000-00805f9b34fb';
+const NOTIFY_UUID  = '0000ff14-0000-1000-8000-00805f9b34fb';
+
+// Command sequences (from working python)
+const HANDSHAKE_18 = new Uint8Array([0x8E,0xFB,0x06,0x17,0x0C,0xA9,0x68,0x23,0x7B,0x4C,0xD2,0x2D,0xDF,0xFA,0x66,0x5B,0x4F,0xE8]);
+const GET_POWER    = new Uint8Array([0x66,0xF0,0xFF,0x77]);
+const CHARGE_ON    = new Uint8Array([0x88,0xF0,0x01,0x88]);
+const CHARGE_OFF   = new Uint8Array([0x88,0xF0,0x00,0x88]);
+function makeOpen(slot){ return new Uint8Array([0xFF,0x4F,0x50,0x45,0x4E,0x00,slot,0xFF,0xFF,0xFE]); }
+
+let device, server, service, writer;
+
+async function connectBLE(){
+  if (demoToggle.checked) throw new Error('Demo mode enabled');
+  statusEl.textContent = 'Requesting Bluetooth device… (Chrome on Android + HTTPS)';
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }],
+      optionalServices: [SERVICE_UUID]
+    });
+    device.addEventListener('gattserverdisconnected', ()=>{
+      statusEl.textContent = 'Disconnected';
+    });
+    server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE_UUID);
+    writer = await svc.getCharacteristic(WRITE_UUID);
+    const notify = await svc.getCharacteristic(NOTIFY_UUID);
+    await notify.startNotifications();
+    notify.addEventListener('characteristicvaluechanged', (e)=>{
+      const val = new Uint8Array(e.target.value.buffer);
+      console.log('Notify:', Array.from(val).map(x=>x.toString(16).padStart(2,'0')).join(' '));
+    });
+    statusEl.textContent = 'Connected to device';
+  } catch (err) {
+    statusEl.textContent = 'BLE connect failed: ' + err.message;
+    throw err;
+  }
+}
+
+function delay(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+async function vend(slot){
+  // Simulated payment (Google Pay sandbox placeholder)
+  // TODO: replace with real GPay flow + server verification
+  const confirmed = true; // assume paid in sandbox
+  if (!confirmed) { statusEl.textContent = 'Payment failed'; return; }
+
+  if (demoToggle.checked) {
+    statusEl.textContent = `DEMO: Would vend Item ${slot}.`;
+    return;
+  }
+
+  try {
+    if(!writer){ await connectBLE(); }
+    statusEl.textContent = `Vending Item ${slot}…`;
+    await writer.writeValue(GET_POWER);
+    await delay(800);
+    await writer.writeValue(HANDSHAKE_18);
+    await delay(800);
+    await writer.writeValue(CHARGE_ON);
+    await delay(1500);
+    await writer.writeValue(makeOpen(slot));
+    await delay(2000);
+    await writer.writeValue(CHARGE_OFF);
+    statusEl.textContent = `Item ${slot} vended (check machine)`;
+  } catch (e) {
+    statusEl.textContent = 'Vend error: ' + e.message;
+  }
+}
+
+// Render 4 items
+const itemsDiv = document.getElementById('items');
+for(let i=1;i<=4;i++){
+  const div = document.createElement('div');
+  div.className = 'item';
+  div.innerHTML = `<h3>Item ${i}</h3><p>Price: ₹100 (sandbox)</p><button data-slot="${i}">Buy</button>`;
+  div.querySelector('button').addEventListener('click', ()=>vend(i));
+  itemsDiv.appendChild(div);
+}
+</script>
+</body>
+</html>
