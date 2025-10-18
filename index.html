@@ -2,136 +2,156 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Smart Vending Machine</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Web-BLE Vending</title>
 <style>
-  body {
-    font-family: Arial, sans-serif;
-    text-align: center;
-    background-color: #f7f7f7;
-    padding: 30px;
-  }
-  h1 { color: #333; }
-  .item {
-    background: white;
-    border-radius: 10px;
-    padding: 15px;
-    margin: 10px auto;
-    width: 250px;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.1);
-  }
-  button {
-    background-color: #007bff;
-    color: white;
-    border: none;
-    padding: 10px 20px;
-    border-radius: 5px;
-    cursor: pointer;
-  }
-  button:disabled {
-    background-color: gray;
-  }
+  body{font-family:system-ui,Arial,sans-serif;background:#f7f7f7;margin:0;padding:24px;text-align:center}
+  h1{margin:0 0 8px}
+  .wrap{max-width:560px;margin:0 auto}
+  .note{color:#555;margin:6px 0 16px}
+  .row{display:flex;flex-wrap:wrap;gap:12px;justify-content:center}
+  .card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,.08);width:240px}
+  button{cursor:pointer;border:0;border-radius:8px;padding:10px 14px;background:#2563eb;color:#fff}
+  button:disabled{opacity:.5}
+  #status{margin-top:14px;color:#111}
+  .top {margin:10px 0 18px}
+  label{font-size:14px;color:#333}
 </style>
 </head>
 <body>
-<h1>Smart Vending Machine</h1>
-<p>Select an item and pay using Google Pay Sandbox</p>
-<div style="margin:10px;">
-  <label><input type="checkbox" id="demoToggle"> Demo mode (no Bluetooth)</label>
+<div class="wrap">
+  <h1>Smart Vending</h1>
+  <p class="note">Use <b>Chrome on Android</b> over <b>HTTPS</b>. Keep your phone within 1–2 m of the device.</p>
+
+  <div class="top">
+    <label><input type="checkbox" id="demoToggle"> Demo mode (no Bluetooth)</label>
+  </div>
+
+  <div class="row" id="items"></div>
+  <div id="status"></div>
 </div>
-<div id="items"></div>
-<p id="status"></p>
 
 <script>
-// --- Environment checks ---
+/* ========= CONFIG (matches your device) ========= */
+const SERVICE_FFC0 = '0000ffc0-0000-1000-8000-00805f9b34fb';
+const WRITE_FFC1   = '0000ffc1-0000-1000-8000-00805f9b34fb'; // write without response
+const NOTIFY_FFC2  = '0000ffc2-0000-1000-8000-00805f9b34fb'; // notify
+
+// Some firmware also mirrors on FF12; keep as fallback:
+const SERVICE_FF12 = '0000ff12-0000-1000-8000-00805f9b34fb';
+const WRITE_FF15   = '0000ff15-0000-1000-8000-00805f9b34fb';
+const NOTIFY_FF14  = '0000ff14-0000-1000-8000-00805f9b34fb';
+
+/* ========= COMMANDS (from your working log) ========= */
+const HANDSHAKE18 = new Uint8Array([0x8E,0xFB,0x06,0x17,0x0C,0xA9,0x68,0x23,0x7B,0x4C,0xD2,0x2D,0xDF,0xFA,0x66,0x5B,0x4F,0xE8]);
+const GET_POWER   = new Uint8Array([0x66,0xF0,0xFF,0x77]);
+const CHARGE_ON   = new Uint8Array([0x88,0xF0,0x01,0x88]);
+const CHARGE_OFF  = new Uint8Array([0x88,0xF0,0x00,0x88]);
+const openFrame   = (slot)=>new Uint8Array([0xFF,0x4F,0x50,0x45,0x4E,0x00,slot&0xFF,0xFF,0xFF,0xFE]);
+
+/* ========= UI + helpers ========= */
 const statusEl = document.getElementById('status');
 const demoToggle = document.getElementById('demoToggle');
-const hasWebBluetooth = !!(navigator.bluetooth);
-if (!hasWebBluetooth) {
-  statusEl.textContent = 'Web Bluetooth not available in this environment. Use Chrome on Android over HTTPS (not in preview). Turning on Demo Mode.';
-  demoToggle.checked = true;
-}
+const itemsEl = document.getElementById('items');
+const delay = (ms)=>new Promise(r=>setTimeout(r,ms));
+const hx = (u8)=>Array.from(u8).map(b=>b.toString(16).padStart(2,'0')).join(' ');
 
-// BLE constants from your verified protocol
-const SERVICE_UUID = '0000ff12-0000-1000-8000-00805f9b34fb';
-const WRITE_UUID   = '0000ff15-0000-1000-8000-00805f9b34fb';
-const NOTIFY_UUID  = '0000ff14-0000-1000-8000-00805f9b34fb';
+/* ========= BLE state ========= */
+let device, server, writer, notifyChar;
 
-// Command sequences (from working python)
-const HANDSHAKE_18 = new Uint8Array([0x8E,0xFB,0x06,0x17,0x0C,0xA9,0x68,0x23,0x7B,0x4C,0xD2,0x2D,0xDF,0xFA,0x66,0x5B,0x4F,0xE8]);
-const GET_POWER    = new Uint8Array([0x66,0xF0,0xFF,0x77]);
-const CHARGE_ON    = new Uint8Array([0x88,0xF0,0x01,0x88]);
-const CHARGE_OFF   = new Uint8Array([0x88,0xF0,0x00,0x88]);
-function makeOpen(slot){ return new Uint8Array([0xFF,0x4F,0x50,0x45,0x4E,0x00,slot,0xFF,0xFF,0xFE]); }
+/* ========= Connect (broad scan + both service options) ========= */
+async function connectBLE() {
+  if (!navigator.bluetooth) throw new Error('Web Bluetooth not supported in this browser');
 
-let device, server, service, writer;
+  statusEl.textContent = 'Scanning for device… grant Bluetooth permission.';
+  // Broad scan so your device appears even if service filtering is quirky.
+  device = await navigator.bluetooth.requestDevice({
+    acceptAllDevices: true,
+    optionalServices: [SERVICE_FFC0, SERVICE_FF12]
+  });
 
-async function connectBLE(){
-  if (demoToggle.checked) throw new Error('Demo mode enabled');
-  statusEl.textContent = 'Requesting Bluetooth device… (Chrome on Android + HTTPS)';
-  try {
-    device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [SERVICE_UUID] }],
-      optionalServices: [SERVICE_UUID]
-    });
-    device.addEventListener('gattserverdisconnected', ()=>{
-      statusEl.textContent = 'Disconnected';
-    });
-    server = await device.gatt.connect();
-    const svc = await server.getPrimaryService(SERVICE_UUID);
-    writer = await svc.getCharacteristic(WRITE_UUID);
-    const notify = await svc.getCharacteristic(NOTIFY_UUID);
-    await notify.startNotifications();
-    notify.addEventListener('characteristicvaluechanged', (e)=>{
-      const val = new Uint8Array(e.target.value.buffer);
-      console.log('Notify:', Array.from(val).map(x=>x.toString(16).padStart(2,'0')).join(' '));
-    });
-    statusEl.textContent = 'Connected to device';
-  } catch (err) {
-    statusEl.textContent = 'BLE connect failed: ' + err.message;
-    throw err;
+  device.addEventListener('gattserverdisconnected', ()=>{ statusEl.textContent='Disconnected'; });
+  server = await device.gatt.connect();
+
+  // Prefer FFC0 path; fall back to FF12 if needed.
+  let svc = null, tried = [];
+  for (const svcUUID of [SERVICE_FFC0, SERVICE_FF12]) {
+    try { svc = await server.getPrimaryService(svcUUID); tried.push(svcUUID); break; }
+    catch { tried.push(svcUUID); }
   }
+  if (!svc) throw new Error('Service not found. Tried: '+tried.join(', '));
+
+  // Try both write/notify pairs in order
+  async function tryPair(writeUUID, notifyUUID) {
+    try {
+      const w = await svc.getCharacteristic(writeUUID);
+      const n = await svc.getCharacteristic(notifyUUID);
+      await n.startNotifications();
+      n.addEventListener('characteristicvaluechanged', e=>{
+        const v = new Uint8Array(e.target.value.buffer);
+        console.log('Notify', notifyUUID.slice(4,8)+':', hx(v));
+      });
+      return {writer: w, notify: n};
+    } catch { return null; }
+  }
+
+  // If using FFC0 service, chars are FFC1/FFC2; if FF12 service, FF15/FF14.
+  const firstTry = (svc.uuid.includes('ffc0'))
+    ? await tryPair(WRITE_FFC1, NOTIFY_FFC2)
+    : await tryPair(WRITE_FF15, NOTIFY_FF14);
+
+  if (firstTry) { writer = firstTry.writer; notifyChar = firstTry.notify; }
+  else {
+    // Cross-try the other pair within the same service
+    const secondTry = (svc.uuid.includes('ffc0'))
+      ? await tryPair(WRITE_FF15, NOTIFY_FF14)
+      : await tryPair(WRITE_FFC1, NOTIFY_FFC2);
+    if (secondTry) { writer = secondTry.writer; notifyChar = secondTry.notify; }
+  }
+
+  if (!writer) throw new Error('Write/Notify characteristics not found on selected service');
+
+  statusEl.textContent = 'Connected';
 }
 
-function delay(ms){ return new Promise(r=>setTimeout(r,ms)); }
-
+/* ========= Vend sequence ========= */
 async function vend(slot){
-  // Simulated payment (Google Pay sandbox placeholder)
-  // TODO: replace with real GPay flow + server verification
-  const confirmed = true; // assume paid in sandbox
-  if (!confirmed) { statusEl.textContent = 'Payment failed'; return; }
+  // (Payment would go here; sandbox stub for now)
+  const paid = true;
+  if (!paid) { statusEl.textContent = 'Payment failed'; return; }
 
-  if (demoToggle.checked) {
-    statusEl.textContent = `DEMO: Would vend Item ${slot}.`;
+  if (demoToggle.checked || !navigator.bluetooth) {
+    statusEl.textContent = `DEMO: would vend item ${slot}`;
     return;
   }
 
   try {
-    if(!writer){ await connectBLE(); }
+    if (!writer) await connectBLE();
     statusEl.textContent = `Vending Item ${slot}…`;
-    await writer.writeValue(GET_POWER);
-    await delay(800);
-    await writer.writeValue(HANDSHAKE_18);
-    await delay(800);
-    await writer.writeValue(CHARGE_ON);
-    await delay(1500);
-    await writer.writeValue(makeOpen(slot));
-    await delay(2000);
+    await writer.writeValue(GET_POWER);    await delay(800);
+    await writer.writeValue(HANDSHAKE18);  await delay(800);
+    await writer.writeValue(CHARGE_ON);    await delay(1500);
+    await writer.writeValue(openFrame(slot)); await delay(2000);
     await writer.writeValue(CHARGE_OFF);
-    statusEl.textContent = `Item ${slot} vended (check machine)`;
+    statusEl.textContent = `Item ${slot} vended (check machine).`;
   } catch (e) {
     statusEl.textContent = 'Vend error: ' + e.message;
   }
 }
 
-// Render 4 items
-const itemsDiv = document.getElementById('items');
-for(let i=1;i<=4;i++){
-  const div = document.createElement('div');
-  div.className = 'item';
-  div.innerHTML = `<h3>Item ${i}</h3><p>Price: ₹100 (sandbox)</p><button data-slot="${i}">Buy</button>`;
-  div.querySelector('button').addEventListener('click', ()=>vend(i));
-  itemsDiv.appendChild(div);
+/* ========= Render 4 items ========= */
+for (let i=1;i<=4;i++){
+  const d = document.createElement('div');
+  d.className = 'card';
+  d.innerHTML = `<h3>Item ${i}</h3><p>Price: ₹100 (sandbox)</p><button id="b${i}">Buy</button>`;
+  d.querySelector('button').addEventListener('click', ()=>vend(i));
+  itemsEl.appendChild(d);
+}
+
+// Helpful message if the environment can’t do BLE.
+if (!('bluetooth' in navigator)) {
+  demoToggle.checked = true;
+  statusEl.textContent = 'This environment has no Web Bluetooth. Use Chrome on Android over HTTPS (Demo mode enabled).';
 }
 </script>
 </body>
